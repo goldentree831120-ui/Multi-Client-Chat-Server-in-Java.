@@ -1,0 +1,7 @@
+# Keep the build context small and never send local builds or git history into the image.
+.git
+out/
+test-out/
+*.class
+docs/
+scripts/

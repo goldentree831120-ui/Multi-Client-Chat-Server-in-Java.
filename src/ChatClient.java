@@ -15,8 +15,10 @@ import java.util.Scanner;
  */
 public class ChatClient {
     public static void main(String[] args) throws IOException {
-        String host = "localhost";
-        int port = 5000;
+        // [docker] host and port can be given, so the same client reaches a container or a
+        // Kubernetes Service: java ChatClient [host] [port]   (defaults: localhost 5000)
+        String host = args.length > 0 ? args[0] : "localhost";
+        int port = args.length > 1 ? Integer.parseInt(args[1]) : 5000;
 
         Socket socket = new Socket(host, port);
         System.out.println("Connected to server at " + host + ":" + port);

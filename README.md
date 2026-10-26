@@ -264,7 +264,7 @@ Metrics are served on port 9100 (`curl localhost:9100/metrics`, see **Monitoring
 Open another terminal:
 
 ```bash
-java -cp out ChatClient
+java -cp out ChatClient                    # or: java -cp out ChatClient <host> <port>
 ```
 
 Open multiple terminals to connect multiple clients.
@@ -506,6 +506,33 @@ All marked in the source:
 - `[fix]` "has left the chat" is only announced for users who had joined; `/msg` can't
   target someone still at the password prompt.
 - Ports come from environment variables so Docker and Kubernetes can set them.
+
+---
+
+## Run it in Docker
+
+```bash
+docker build -t chat-server:local .        # compiles AND runs the 28 tests; no image if a test fails
+docker run --rm -p 5000:5000 -p 9100:9100 chat-server:local
+java -cp out ChatClient localhost 5000     # from another terminal (host and port are optional)
+curl localhost:9100/metrics
+./scripts/docker-smoke.sh                  # builds, starts, checks from outside, cleans up
+```
+
+How the image is built (`Dockerfile`):
+
+| Choice | Why |
+|---|---|
+| Two stages: JDK to build, JRE to run | The build stage compiles and **runs the test suite**; the final image ships only the JRE and the compiled server classes (no compiler, no tests, no source). |
+| `eclipse-temurin:21` (Ubuntu Noble) | Official OpenJDK builds; Java 21 is the current LTS. |
+| Runs as uid 10001, not root | A bug in the server can't act as root inside the container. Kubernetes can enforce this later with `runAsNonRoot`. |
+| `-XX:MaxRAMPercentage=75` | The JVM sizes its heap from the container's memory limit, not the whole machine's. |
+| `CHAT_LOG_MESSAGES=false` | Printing every chat line to the console slows the server under load and floods `docker logs`. |
+| `.dockerignore` | Keeps `.git`, local builds and docs out of the image and the build context. |
+
+`scripts/docker-smoke.sh` checks the running container from the outside: `/healthz` and `/readyz`
+return 200, `/metrics` shows `chat_active_connections 0`, a real TCP connection moves it to 1,
+and the process runs as uid 10001.
 
 ---
 

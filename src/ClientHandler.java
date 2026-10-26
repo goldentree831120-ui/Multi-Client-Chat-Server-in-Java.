@@ -5,6 +5,9 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
+ * v5: v4c + Prometheus metrics (lines marked [metrics]) and a fix for
+ * broadcasting to clients that have not finished logging in (marked [fix]).
+ *
  * v4c: Handles ONE client's connection on its own dedicated thread.
  * Adds a basic register/login step (PLAINTEXT, in-memory only -- teaching
  * purposes, not secure) on top of room-scoped broadcast chat, private
@@ -14,9 +17,13 @@ public class ClientHandler implements Runnable {
 
     private final Socket socket;
     private final List<ClientHandler> allClients;
-    private PrintWriter out;
-    private String username;
-    private String currentRoom = "general"; // everyone starts in the same default room
+    // volatile: these are written by this client's thread and read by OTHER
+    // clients' threads (broadcast, /who, /msg). Without volatile, another thread
+    // may see a stale value. [fix]
+    private volatile PrintWriter out;
+    private volatile String username;
+    private volatile String currentRoom = "general"; // everyone starts in the same default room
+    private volatile boolean loggedIn = false; // [fix] only logged-in clients receive chat
 
     // Shared across ALL ClientHandler instances/threads -- used to make
     // "check if username taken" + "reserve it" a single atomic operation.
@@ -27,6 +34,14 @@ public class ClientHandler implements Runnable {
     // restart since we have no persistent storage yet.
     private static final Map<String, String> registeredUsers = new ConcurrentHashMap<>();
     private static final int MAX_LOGIN_ATTEMPTS = 3;
+
+    // Printing every chat line to stdout is fine for a demo, but under load the
+    // console becomes the bottleneck and distorts the latency numbers.
+    // CHAT_LOG_MESSAGES=false turns it off (the load test does this).
+    private static final boolean LOG_MESSAGES =
+            !"false".equalsIgnoreCase(System.getenv().getOrDefault("CHAT_LOG_MESSAGES", "true"));
+
+    private boolean counted = false; // [metrics] did we inc ACTIVE_CONNECTIONS?
 
     public ClientHandler(Socket socket, List<ClientHandler> allClients) {
         this.socket = socket;
@@ -44,6 +59,8 @@ public class ClientHandler implements Runnable {
                         new InputStreamReader(socket.getInputStream()));
                 PrintWriter writer = new PrintWriter(socket.getOutputStream(), true)) {
             this.out = writer; // stored so broadcast() can reach this client too
+            Metrics.ACTIVE_CONNECTIONS.inc(); // [metrics] dec in disconnect()
+            counted = true;
 
             // --- One-time handshake: get a unique username before any chat logic ---
             while (true) {
@@ -65,6 +82,7 @@ public class ClientHandler implements Runnable {
                 // so two people can never both "win" the same username.
                 synchronized (userLock) {
                     if (isUsernameTaken(candidate)) {
+                        Metrics.USERNAME_REJECTIONS.inc(); // [metrics]
                         out.println("Username '" + candidate + "' is already taken. Try another.");
                         continue;
                     }
@@ -76,49 +94,65 @@ public class ClientHandler implements Runnable {
 
             // --- Login / registration step ---
             if (!authenticate(in)) {
+                Metrics.LOGIN_FAILURES.inc(); // [metrics]
                 out.println("Too many failed attempts. Disconnecting.");
                 return; // finally block still runs disconnect() cleanup
             }
+
+            loggedIn = true;
+            Metrics.LOGGED_IN_USERS.inc(); // [metrics] dec in disconnect()
 
             // Tell everyone else (not this new client) that someone joined.
             broadcast(username + " has joined the chat", this);
 
             String line;
             while ((line = in.readLine()) != null) {
-                System.out.println("[" + username + "] " + line);
+                // [metrics] Start the clock as soon as the line is read. The
+                // histogram measures OUR handling time (parsing + writing to every
+                // recipient), not network time, which the server can't see.
+                long started = System.nanoTime();
+                if (LOG_MESSAGES) System.out.println("[" + username + "] " + line);
 
-                if (line.equalsIgnoreCase("quit")) {
+                String type = handleLine(line);
+                Metrics.MESSAGES_PROCESSED.inc(type); // [metrics]
+                Metrics.MESSAGE_LATENCY.observeSince(started); // [metrics]
+
+                if (type.equals("quit")) {
                     break;
                 }
-
-                if (line.startsWith("/msg ")) {
-                    handlePrivateMessage(line);
-                    continue;
-                }
-
-                if (line.startsWith("/join ")) {
-                    handleJoinRoom(line);
-                    continue;
-                }
-
-                if (line.equalsIgnoreCase("/who")) {
-                    handleWho();
-                    continue;
-                }
-
-                if (line.equalsIgnoreCase("/leave")) {
-                    handleLeaveRoom();
-                    continue;
-                }
-
-                // Exclude the sender so they don't see their own message echoed back.
-                broadcast(username + ": " + line, this);
             }
         } catch (IOException e) {
             System.out.println("Connection error: " + e.getMessage());
         } finally {
             disconnect();
         }
+    }
+
+    // Dispatches one chat line and returns its type, used as the metric label.
+    // (Same logic as v4c's if-chain, moved into a method so it can be timed.)
+    private String handleLine(String line) {
+        if (line.equalsIgnoreCase("quit")) {
+            return "quit";
+        }
+        if (line.startsWith("/msg ")) {
+            handlePrivateMessage(line);
+            return "private";
+        }
+        if (line.startsWith("/join ")) {
+            handleJoinRoom(line);
+            return "join";
+        }
+        if (line.equalsIgnoreCase("/who")) {
+            handleWho();
+            return "who";
+        }
+        if (line.equalsIgnoreCase("/leave")) {
+            handleLeaveRoom();
+            return "leave";
+        }
+        // Exclude the sender so they don't see their own message echoed back.
+        broadcast(username + ": " + line, this);
+        return "broadcast";
     }
 
     // Handles login (existing account) or registration (new account) for
@@ -193,7 +227,7 @@ public class ClientHandler implements Runnable {
         StringBuilder sb = new StringBuilder("Users in room '" + currentRoom + "': ");
         boolean first = true;
         for (ClientHandler client : allClients) {
-            if (client.username != null && client.currentRoom.equals(currentRoom)) {
+            if (client.loggedIn && client.currentRoom.equals(currentRoom)) {
                 if (!first) {
                     sb.append(", ");
                 }
@@ -223,7 +257,7 @@ public class ClientHandler implements Runnable {
 
         ClientHandler target = findClientByUsername(targetName);
 
-        if (target == null) {
+        if (target == null || !target.loggedIn) { // [fix] not to users still at the password prompt
             out.println("User '" + targetName + "' not found or offline.");
             return;
         }
@@ -255,7 +289,10 @@ public class ClientHandler implements Runnable {
     // where there's no single "sender" to skip).
     private void broadcastToRoom(String room, String message, ClientHandler exclude) {
         for (ClientHandler client : allClients) {
-            if (client != exclude && client.currentRoom.equals(room)) {
+            // [fix] v4c also wrote to clients still at the username/password
+            // prompt, and to clients whose thread had not set `out` yet (a
+            // NullPointerException in the SENDER's thread). Skip both.
+            if (client != exclude && client.loggedIn && client.currentRoom.equals(room)) {
                 client.out.println(message);
             }
         }
@@ -270,12 +307,18 @@ public class ClientHandler implements Runnable {
     // and tells everyone remaining that this user left.
     private void disconnect() {
         allClients.remove(this);
+        if (counted) Metrics.ACTIVE_CONNECTIONS.dec(); // [metrics]
+        boolean wasLoggedIn = loggedIn;
+        if (wasLoggedIn) {
+            loggedIn = false;
+            Metrics.LOGGED_IN_USERS.dec(); // [metrics]
+        }
         try {
             socket.close();
         } catch (IOException e) {
             // ignore -- socket is going away regardless
         }
-        if (username != null) {
+        if (wasLoggedIn) { // [fix] don't announce users who never finished logging in
             broadcast(username + " has left the chat", this);
         }
         System.out.println("Disconnected: " + username

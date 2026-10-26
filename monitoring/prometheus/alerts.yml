@@ -1,0 +1,30 @@
+groups:
+  - name: chat-server
+    rules:
+      # The main alert: users feel slow chat. p95 of the server's own handling time (read a
+      # line -> written to every recipient) above 50 ms for 2 minutes. Normal is well under
+      # 1 ms (see the README), so 50 ms means something is badly wrong: a stuck recipient,
+      # CPU starvation, GC pauses. With no traffic the rate is 0, the quantile is NaN and the
+      # alert stays quiet, which is what we want at 3 a.m. on an empty server.
+      - alert: ChatHighMessageLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(chat_message_handling_seconds_bucket[1m]))
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chat p95 message handling time is {{ $value | humanizeDuration }} (over 50 ms for 2 min)"
+          runbook: "docs/RUNBOOK.md#latency-is-high"
+
+      # Prometheus can't scrape the server at all: process down, port closed, or container
+      # restarting. 30 s = 6 failed scrapes, so one slow scrape doesn't page anyone.
+      - alert: ChatServerDown
+        expr: up{job="chat"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot scrape the chat server ({{ $labels.instance }})"
+          runbook: "docs/RUNBOOK.md#server-down"

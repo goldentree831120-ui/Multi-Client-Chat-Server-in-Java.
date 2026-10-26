@@ -1,0 +1,78 @@
+# Unit tests for the alert rules: `promtool test rules monitoring/prometheus/alerts.test.yml`
+# Each test feeds made-up time series and checks which alerts fire at which time.
+rule_files:
+  - alerts.yml
+evaluation_interval: 15s
+
+tests:
+  # Fast messages: 100 per minute, all under 1 ms -> no latency alert.
+  - interval: 15s
+    input_series:
+      - series: 'chat_message_handling_seconds_bucket{le="0.001"}'
+        values: '0+25x40'
+      - series: 'chat_message_handling_seconds_bucket{le="0.05"}'
+        values: '0+25x40'
+      - series: 'chat_message_handling_seconds_bucket{le="0.1"}'
+        values: '0+25x40'
+      - series: 'chat_message_handling_seconds_bucket{le="+Inf"}'
+        values: '0+25x40'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ChatHighMessageLatency
+        exp_alerts: []
+
+  # Slow messages: every message between 50 and 100 ms -> p95 about 97 ms -> fires after 2 min.
+  - interval: 15s
+    input_series:
+      - series: 'chat_message_handling_seconds_bucket{le="0.001"}'
+        values: '0x40'
+      - series: 'chat_message_handling_seconds_bucket{le="0.05"}'
+        values: '0x40'
+      - series: 'chat_message_handling_seconds_bucket{le="0.1"}'
+        values: '0+25x40'
+      - series: 'chat_message_handling_seconds_bucket{le="+Inf"}'
+        values: '0+25x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ChatHighMessageLatency
+        exp_alerts: []                 # slow, but not for 2 minutes yet
+      - eval_time: 5m
+        alertname: ChatHighMessageLatency
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Chat p95 message handling time is 97.5ms (over 50 ms for 2 min)"
+              runbook: "docs/RUNBOOK.md#latency-is-high"
+
+  # No traffic at all -> quantile is NaN -> no alert.
+  - interval: 15s
+    input_series:
+      - series: 'chat_message_handling_seconds_bucket{le="0.05"}'
+        values: '0x40'
+      - series: 'chat_message_handling_seconds_bucket{le="+Inf"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ChatHighMessageLatency
+        exp_alerts: []
+
+  # Scrapes fail -> ChatServerDown after 30 s, not before.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="chat", instance="chat:9100"}'
+        values: '1 1 1 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: ChatServerDown
+        exp_alerts: []
+      - eval_time: 90s
+        alertname: ChatServerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: chat
+              instance: "chat:9100"
+            exp_annotations:
+              summary: "Prometheus cannot scrape the chat server (chat:9100)"
+              runbook: "docs/RUNBOOK.md#server-down"

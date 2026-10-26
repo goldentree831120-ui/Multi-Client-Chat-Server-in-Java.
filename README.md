@@ -230,6 +230,12 @@ src/
 └── MetricsServer.java     HTTP endpoint: /metrics, /healthz, /readyz
 test/
 └── ChatServerTest.java    automated tests: starts the real server and connects real clients
+tools/
+└── LoadTest.java          traffic generator measuring end-to-end latency
+monitoring/                Prometheus config + alert rules (with tests), Grafana provisioning + dashboard
+scripts/                   docker-smoke.sh, monitoring-up.sh
+docs/RUNBOOK.md            what to check when an alert fires
+Dockerfile, docker-compose.yml
 ```
 
 ---
@@ -533,6 +539,55 @@ How the image is built (`Dockerfile`):
 `scripts/docker-smoke.sh` checks the running container from the outside: `/healthz` and `/readyz`
 return 200, `/metrics` shows `chat_active_connections 0`, a real TCP connection moves it to 1,
 and the process runs as uid 10001.
+
+---
+
+## Monitoring with Prometheus and Grafana
+
+```bash
+./scripts/monitoring-up.sh      # starts chat + Prometheus + Grafana, sends 60 s of traffic, checks everything
+docker compose down             # stop
+```
+
+| Service | Address | What's there |
+|---|---|---|
+| Chat server | `localhost:5000`, metrics on `localhost:9100/metrics` | the server, built from the `Dockerfile` |
+| Prometheus 3.5.0 | http://localhost:9090 | scrapes the server every 5 s, evaluates the alert rules |
+| Grafana 12.1.1 | http://localhost:3000 | the **Chat server** dashboard, set as the home page; viewing needs no login |
+
+All ports are bound to `127.0.0.1`, so nothing is reachable from other machines. Grafana's data
+source and dashboard are provisioned from files in `monitoring/grafana/`, so a fresh
+`docker compose up` always has them, with nothing to click through.
+
+**Dashboard** (`monitoring/grafana/dashboards/chat-server.json`): server up, open connections,
+logged-in users, messages per second, p95 handling time and firing alerts at the top; below,
+message rate by type, p50/p95/p99 handling time, connections over time, and login problems
+(username collisions, logins dropped after 3 wrong passwords).
+
+**Alert rules** (`monitoring/prometheus/alerts.yml`), each pointing to a section of
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md):
+
+| Alert | Fires when | Why that threshold |
+|---|---|---|
+| `ChatHighMessageLatency` | p95 server handling time > 50 ms for 2 min | normal is far below 1 ms; 50 ms means something is wrong, and 2 min avoids paging on one burst. No traffic means no alert. |
+| `ChatServerDown` | Prometheus can't scrape `/metrics` for 30 s | 6 failed scrapes in a row, not one slow one |
+
+The rules have unit tests (`monitoring/prometheus/alerts.test.yml`): fast traffic doesn't fire,
+slow traffic fires only after 2 minutes, an idle server stays quiet, and the down alert waits 30
+seconds. Run them with Prometheus's `promtool`:
+
+```bash
+docker run --rm -v "$PWD/monitoring/prometheus:/p" --entrypoint promtool prom/prometheus:v3.5.0 test rules /p/alerts.test.yml
+```
+
+**Traffic generator** (`tools/LoadTest.java`): opens real client connections, registers users,
+puts them in rooms and sends timed messages, measuring end-to-end latency from send to receipt
+by the other clients in the room. Step 5 uses it for the load test.
+
+```bash
+javac -d out src/*.java tools/*.java
+java -cp out LoadTest localhost 5000 20 4 50 60   # host port clients rooms msg/s seconds
+```
 
 ---
 

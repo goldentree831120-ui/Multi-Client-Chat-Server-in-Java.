@@ -1,0 +1,59 @@
+# M-A step 3: the chat server + Prometheus + Grafana, all on this machine.
+#
+#   docker compose up -d --build     start (first run downloads ~600 MB of images)
+#   docker compose ps                status
+#   docker compose down              stop (add -v to also delete Prometheus/Grafana data)
+#
+# Every port is published on 127.0.0.1 only, so nothing is reachable from other machines.
+#   chat        localhost:5000 (chat)  localhost:9100/metrics
+#   Prometheus  http://localhost:9090  (targets, queries, alerts)
+#   Grafana     http://localhost:3000  (dashboard "Chat server", no login needed to view)
+name: chat-monitoring
+
+services:
+  chat:
+    build: .
+    image: chat-server:local
+    ports:
+      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:9100:9100"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - chat
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    environment:
+      # Anyone who can reach localhost:3000 can VIEW dashboards without logging in; editing
+      # needs the admin login. Ports are bound to 127.0.0.1, so that is only you.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/chat-server.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

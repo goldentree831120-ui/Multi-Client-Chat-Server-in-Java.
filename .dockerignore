@@ -8,3 +8,4 @@ scripts/
 monitoring/
 tools/
 docker-compose.yml
+k8s/

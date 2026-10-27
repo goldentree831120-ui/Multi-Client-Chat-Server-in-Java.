@@ -57,8 +57,8 @@ public class LoadTest {
                 System.err.println("connect/login failed for client " + i + ": " + e.getMessage());
             }
         }
-        System.out.printf("connected and logged in: %d/%d in %.1f s%n",
-                conns.size(), clients, (System.nanoTime() - connectStart) / 1e9);
+        double connectSeconds = (System.nanoTime() - connectStart) / 1e9;
+        System.out.printf("connected and logged in: %d/%d in %.1f s%n", conns.size(), clients, connectSeconds);
         if (conns.size() < 2) System.exit(1);
 
         ScheduledExecutorService sender = Executors.newSingleThreadScheduledExecutor();
@@ -80,10 +80,11 @@ public class LoadTest {
         Thread.sleep(1000); // let the last messages arrive
 
         for (Conn c : conns) c.close();
-        report(sent.get(), received.get(), errors.get(), seconds, latenciesNanos, conns.size(), rooms);
+        report(sent.get(), received.get(), errors.get(), seconds, latenciesNanos, conns.size(), rooms, rate, connectSeconds);
     }
 
-    static void report(long sent, long received, long errors, int seconds, ConcurrentLinkedQueue<Long> lat, int clients, int rooms) {
+    static void report(long sent, long received, long errors, int seconds, ConcurrentLinkedQueue<Long> lat, int clients,
+                       int rooms, int rate, double connectSeconds) {
         long[] v = lat.stream().mapToLong(Long::longValue).toArray();
         Arrays.sort(v);
         double expectedPerMsg = (double) clients / rooms - 1; // everyone else in the sender's room
@@ -96,6 +97,12 @@ public class LoadTest {
             System.out.printf("end-to-end latency:  p50 %.2f ms   p95 %.2f ms   p99 %.2f ms   max %.2f ms%n",
                     pct(v, 50), pct(v, 95), pct(v, 99), v[v.length - 1] / 1e6);
         }
+        // One machine-readable line for scripts/load-matrix.sh
+        System.out.printf("RESULT clients=%d rooms=%d rate=%d seconds=%d connect_s=%.2f sent=%d received=%d expected=%.0f "
+                        + "errors=%d p50_ms=%.2f p95_ms=%.2f p99_ms=%.2f max_ms=%.2f%n",
+                clients, rooms, rate, seconds, connectSeconds, sent, received, sent * expectedPerMsg, errors,
+                v.length > 0 ? pct(v, 50) : -1, v.length > 0 ? pct(v, 95) : -1, v.length > 0 ? pct(v, 99) : -1,
+                v.length > 0 ? v[v.length - 1] / 1e6 : -1);
     }
 
     static double pct(long[] sorted, double p) {

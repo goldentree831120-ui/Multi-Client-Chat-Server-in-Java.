@@ -1,0 +1,98 @@
+# The chat server on Kubernetes: a Deployment (keeps 1 Pod running, replaces it if it dies)
+# and a Service (a stable name and address in front of whichever Pod is current).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-server
+  namespace: chat
+  labels:
+    app: chat-server
+spec:
+  # ONE replica on purpose: users, rooms and accounts live in the server's memory, so two Pods
+  # would be two separate chat servers and users on different Pods couldn't see each other.
+  # Scaling out needs shared state first (e.g. Redis pub/sub); see docs/KUBERNETES.md.
+  replicas: 1
+  # Recreate, not RollingUpdate: during an update the old Pod is stopped before the new one
+  # starts, so there are never two chat servers with split users at the same time.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: chat-server
+  template:
+    metadata:
+      labels:
+        app: chat-server
+    spec:
+      securityContext:
+        runAsNonRoot: true          # refuse to start if the image would run as root
+        runAsUser: 10001            # the user created in the Dockerfile
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: chat-server
+          image: chat-server:local  # built locally and loaded into kind (no registry)
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: chat
+              containerPort: 5000
+            - name: metrics
+              containerPort: 9100
+          env:
+            - name: CHAT_LOG_MESSAGES
+              value: "false"
+          # Readiness: "send me traffic?" The Service only routes to the Pod once /readyz says
+          # the chat port is bound. Liveness: "am I stuck?" If /healthz stops answering three
+          # times in a row, Kubernetes restarts the container.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:               # what the scheduler reserves on a node for this Pod
+              cpu: 100m
+              memory: 128Mi
+            limits:                 # hard caps; the JVM sizes its heap to 75% of this memory
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp             # the JVM writes small files to /tmp; everything else is read-only
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-server
+  namespace: chat
+  labels:
+    app: chat-server
+spec:
+  # ClusterIP: reachable inside the cluster as chat-server.chat.svc:5000 (Prometheus uses that).
+  # From your laptop you reach it with `kubectl port-forward` (see scripts/k8s-up.sh).
+  type: ClusterIP
+  selector:
+    app: chat-server          # sends traffic to Pods with this label that are READY
+  ports:
+    - name: chat
+      port: 5000
+      targetPort: chat
+    - name: metrics
+      port: 9100
+      targetPort: metrics

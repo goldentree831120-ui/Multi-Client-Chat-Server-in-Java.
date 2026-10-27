@@ -1,5 +1,7 @@
 # Multi-Client Chat Server in Java
 
+[![CI](https://github.com/goldentree831120-ui/Multi-Client-Chat-Server-in-Java./actions/workflows/ci.yml/badge.svg)](https://github.com/goldentree831120-ui/Multi-Client-Chat-Server-in-Java./actions/workflows/ci.yml)
+
 A simple **multi-client chat server built from scratch in Java** using raw TCP sockets and Java multithreading.
 
 I built this project as a **summer internship project under Prof. Pawan Kumar, Department of Mathematics, IIT Kharagpur**, mainly to understand how networked applications actually work at a lower level rather than relying on frameworks.
@@ -233,8 +235,12 @@ test/
 tools/
 └── LoadTest.java          traffic generator measuring end-to-end latency
 monitoring/                Prometheus config + alert rules (with tests), Grafana provisioning + dashboard
-scripts/                   docker-smoke.sh, monitoring-up.sh
-docs/RUNBOOK.md            what to check when an alert fires
+k8s/                       Kubernetes manifests (namespace, chat server, Prometheus) and kind cluster config
+scripts/                   docker-smoke.sh, monitoring-up.sh, load-matrix.sh, install-k8s-tools.sh, k8s-up.sh, k8s-down.sh
+docs/RUNBOOK.md            what to check when an alert fires, with measured "normal" values
+docs/LOADTEST.md           load test results and analysis
+.github/workflows/ci.yml   CI: build, tests, Docker smoke test, config checks, kind deployment
+docs/KUBERNETES.md         Pods, Deployments, Services and probes, explained with this project
 Dockerfile, docker-compose.yml
 ```
 
@@ -559,6 +565,8 @@ All ports are bound to `127.0.0.1`, so nothing is reachable from other machines.
 source and dashboard are provisioned from files in `monitoring/grafana/`, so a fresh
 `docker compose up` always has them, with nothing to click through.
 
+![Grafana dashboard during a 60 s load test](docs/img/grafana-dashboard.png)
+
 **Dashboard** (`monitoring/grafana/dashboards/chat-server.json`): server up, open connections,
 logged-in users, messages per second, p95 handling time and firing alerts at the top; below,
 message rate by type, p50/p95/p99 handling time, connections over time, and login problems
@@ -588,6 +596,67 @@ by the other clients in the room. Step 5 uses it for the load test.
 javac -d out src/*.java tools/*.java
 java -cp out LoadTest localhost 5000 20 4 50 60   # host port clients rooms msg/s seconds
 ```
+
+## Load test
+
+```bash
+./scripts/load-matrix.sh     # about 6 minutes; needs the docker compose stack (starts it if needed)
+```
+
+Four levels, 60 s each, against the docker compose stack: 20 clients / 50 msg/s, 100 / 200,
+200 / 500 and 500 / 1000. For each level it records end-to-end latency (`tools/LoadTest.java`),
+the server's own p95/p99 from Prometheus, delivered vs expected messages, errors, and the chat
+container's peak CPU and memory, and writes them to `docs/loadtest-latest.md`.
+
+**Results on my laptop** (i5-10210U, WSL 2 with 3 GiB; load generator on the same machine), full
+analysis in [`docs/LOADTEST.md`](docs/LOADTEST.md):
+
+- No message lost at any level: 1.5 million deliveries, 0 errors.
+- Up to 4,500 deliveries/s (200 clients, 500 msg/s, rooms of 10): end-to-end median 1.2 ms, server p95 0.86 ms.
+- 19,000 deliveries/s (500 clients, 1,000 msg/s, rooms of 20) is past this laptop's limit: about
+  3 cores used, median 457 ms, p95 8 s. Late, not lost.
+- The tail varies from run to run (p95 3–272 ms over four runs of the same level) because of a few
+  0.4–2 s stalls. GC logging ruled out garbage collection (one 79 ms pause); the likely cause, not
+  yet proven, is the load generator sharing the laptop with the server.
+
+## Running on Kubernetes (kind)
+
+```bash
+./scripts/install-k8s-tools.sh   # once: kind v0.29.0 + kubectl v1.33.1 into ~/.local/bin, checksums verified
+./scripts/k8s-up.sh              # cluster, deploy, checks, traffic, self-healing demo
+./scripts/k8s-down.sh            # delete the cluster
+```
+
+`k8s-up.sh` creates a one-node cluster with [kind](https://kind.sigs.k8s.io), copies the locally
+built image into it, and deploys two things into the namespace `chat`:
+
+| Resource | File | Notes |
+|---|---|---|
+| Deployment + Service `chat-server` | `k8s/chat-server.yaml` | 1 replica (state is in memory), `Recreate` updates, readiness probe on `/readyz`, liveness on `/healthz`, CPU/memory requests and limits, non-root with a read-only filesystem |
+| Deployment + Service `prometheus` | `k8s/prometheus.yaml` | scrapes `chat-server.chat.svc.cluster.local:9100`, uses the same `alerts.yml` as docker compose (ConfigMap) |
+
+Then it checks the chat server and Prometheus through `kubectl port-forward`, sends 30 s of chat
+traffic with `LoadTest`, and deletes the chat Pod to show the Deployment replacing it, printing
+how long the new Pod took to become Ready.
+
+On my laptop: 1,500 messages, 6,000 of 6,000 deliveries, 0 errors, end-to-end p50 4.54 ms (p95
+6.63 ms), and the deleted Pod was replaced and Ready in 6 s. The latency is higher than with
+docker compose (p50 1.31 ms) because `kubectl port-forward` tunnels every byte through the
+Kubernetes API server; it is a test path, not how production traffic would reach a Service.
+
+How Pods, Deployments, Services and probes fit together, and why each setting was chosen:
+[`docs/KUBERNETES.md`](docs/KUBERNETES.md).
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, in four jobs:
+
+| Job | What it proves |
+|---|---|
+| Java | the code compiles with all warnings on, and the 28 server tests pass |
+| Docker | the image builds (which runs the tests again) and passes the smoke test from outside |
+| Config | Prometheus accepts both configs, the alert rule unit tests pass, the Kubernetes manifests pass a strict schema check, the dashboard is valid, and the scripts pass `shellcheck` |
+| Kubernetes | a real kind cluster: deploy, readiness through the Service, Prometheus scraping it, traffic with `LoadTest`, and Pod replacement (`scripts/k8s-up.sh`, the same script as on the laptop) |
 
 ---
 

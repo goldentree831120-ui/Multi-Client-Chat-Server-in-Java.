@@ -37,7 +37,8 @@ echo "sending 60 s of chat traffic (20 clients, 4 rooms, 50 msg/s) so the graphs
 javac -d out src/*.java tools/*.java
 java -cp out LoadTest localhost 5000 20 4 50 60
 sleep 10
-echo "ok  Prometheus counted $(prom_value 'sum(increase(chat_messages_processed_total{type="broadcast"}[5m]))' | cut -d. -f1) broadcast messages in the last 5 min"
+# Read the raw counter: increase() over a window is an estimate and can overshoot at the edges.
+echo "ok  Prometheus reads $(prom_value 'sum(chat_messages_processed_total{type="broadcast"})') broadcast messages handled since the server started"
 echo
 echo "Open in your browser:"
 echo "  Grafana     http://localhost:3000      (the 'Chat server' dashboard is the home page)"

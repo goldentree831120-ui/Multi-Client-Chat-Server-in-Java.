@@ -1,0 +1,6 @@
+# Everything for this project lives in its own namespace, so `kubectl delete namespace chat`
+# removes all of it in one go and it can't collide with anything else in the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chat
